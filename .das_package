@@ -6,4 +6,15 @@ require daslib/daspkg
 def package() {
     package_name("das-claude")
     package_description("Typed bindings for the Anthropic Claude Messages API")
+    package_author("borisbat")
+    package_license("BSD-3-Clause")
+    package_tag("ai")
+    package_tag("api")
+    package_tag("http")
+    package_min_sdk("0.4")
+}
+
+[export]
+def dependencies() {
+    require_package("github.com/borisbat/dasHV")
 }
