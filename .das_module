@@ -1,0 +1,8 @@
+options gen2
+
+require fio
+
+[export]
+def initialize(project_path : string) {
+    register_native_path("anthropic", "anthropic", "{project_path}/anthropic/anthropic.das")
+}

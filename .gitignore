@@ -1,0 +1,5 @@
+*.das.bak
+*.swp
+*~
+.vs/
+build/
