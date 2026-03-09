@@ -840,3 +840,215 @@ def public run_tool_loop(config : ClaudeConfig;
     }
     return <- msg
 }
+
+// ============================================================================
+// v1 — Streaming HTTP client
+// ============================================================================
+
+def public parse_sse_lines(var buf : string&; callback : block<(event_type, data : string) : void>) {
+    //! Parse accumulated SSE buffer into event/data pairs.
+    //! Consumes complete events from ``buf``, leaving any partial trailing data.
+    while (true) {
+        // find double-newline boundary (event separator)
+        let boundary = find(buf, "\n\n")
+        if (boundary < 0) {
+            break
+        }
+        let event_text = slice(buf, 0, boundary)
+        buf = slice(buf, boundary + 2)
+        // parse event: and data: lines
+        var event_type = ""
+        var data = ""
+        var pos = 0
+        while (pos < length(event_text)) {
+            let nl = find(event_text, "\n", pos)
+            let line_end = nl >= 0 ? nl : length(event_text)
+            let line = slice(event_text, pos, line_end)
+            if (starts_with(line, "event: ")) {
+                event_type = slice(line, 7)
+            } elif (starts_with(line, "data: ")) {
+                data = slice(line, 6)
+            }
+            pos = line_end + 1
+        }
+        if (!empty(data)) {
+            invoke(callback, event_type, data)
+        }
+    }
+}
+
+def public create_message_stream(config : ClaudeConfig;
+                                 var params : MessageCreateParams;
+                                 callback : block<(event : StreamEvent) : void>;
+                                 var error : string&) : void {
+    //! Send a streaming Messages API request, invoking ``callback`` for each server-sent event.
+    //! Sets ``error`` on failure. Modifies ``params`` to apply config defaults.
+    if (empty(params.model)) {
+        params.model = config.model
+    }
+    if (params.max_tokens == 0) {
+        params.max_tokens = config.max_tokens
+    }
+    params.stream = true
+    let body = build_request_json(params)
+    let url = "{config.base_url}/v1/messages"
+    var headers <- make_headers(config)
+    error = ""
+    var buf : string
+    var http_error = false
+    with_http_request() <| $(var req) {
+        req.method = http_method.POST
+        req.url := url
+        req.body := body
+        for (k, v in keys(headers), values(headers)) {
+            req |> set_header(k, v)
+        }
+        request_cb(req, $(data : string) {
+            if (http_error) {
+                return
+            }
+            buf = "{buf}{data}"
+            parse_sse_lines(buf) <| $(event_type, json_data : string) {
+                if (event_type == "error") {
+                    error = json_data
+                    return
+                }
+                var parse_err = ""
+                var event = parse_stream_event(json_data, parse_err)
+                if (!empty(parse_err)) {
+                    error = "SSE parse error: {parse_err}"
+                    return
+                }
+                invoke(callback, event)
+            }
+        }) <| $(var resp) {
+            if (resp.status_code != http_status.OK) {
+                http_error = true
+                peek(resp.body) <| $(text : string#) {
+                    error = "HTTP {int(resp.status_code)}: {text}"
+                }
+            }
+        }
+    }
+}
+
+def public ask_stream(config : ClaudeConfig; prompt : string;
+                      on_text : block<(text : string) : void>;
+                      var error : string&) : string {
+    //! One-shot streaming convenience: send a user message, invoke ``on_text`` for each text delta,
+    //! and return the full accumulated text.
+    var params : MessageCreateParams
+    params.messages |> emplace(user_message(prompt))
+    var result : string
+    create_message_stream(config, params, $(event : StreamEvent) {
+        if (event is _content_block_delta) {
+            let ev & = unsafe(event as _content_block_delta)
+            if (ev.delta is _text_delta) {
+                let fragment = (ev.delta as _text_delta).text
+                result = "{result}{fragment}"
+                invoke(on_text, fragment)
+            }
+        }
+    }, error)
+    return result
+}
+
+def public run_tool_loop_stream(config : ClaudeConfig;
+                                var params : MessageCreateParams;
+                                handler : block<(tc : ToolUseBlock) : string>;
+                                on_event : block<(event : StreamEvent) : void>;
+                                var error : string&;
+                                max_iterations : int = 10) : Message {
+    //! Streaming tool-use loop: like ``run_tool_loop``, but streams each Claude turn
+    //! and invokes ``on_event`` for every SSE event. Returns the final assembled ``Message``.
+    var msg : Message
+    for (_ in range(max_iterations)) {
+        // stream the turn, accumulating the response into a Message
+        msg = default<Message>
+        var content_blocks : array<ContentBlock>
+        var tool_json_bufs : table<int; string>
+        create_message_stream(config, params, $(event : StreamEvent) {
+            invoke(on_event, event)
+            if (event is _message_start) {
+                let ev & = unsafe(event as _message_start)
+                msg.id = ev.message.id
+                msg.model = ev.message.model
+                msg.role = ev.message.role
+                msg.usage = ev.message.usage
+            } elif (event is _content_block_start) {
+                let ev & = unsafe(event as _content_block_start)
+                while (length(content_blocks) <= ev.index) {
+                    content_blocks |> emplace(ContentBlock(_text = TextBlock()))
+                }
+                if (ev.content_block is _text) {
+                    content_blocks[ev.index] = ContentBlock(_text = TextBlock(text = (ev.content_block as _text).text))
+                } elif (ev.content_block is _tool_use) {
+                    let tc & = unsafe(ev.content_block as _tool_use)
+                    content_blocks[ev.index] = ContentBlock(_tool_use = ToolUseBlock(id = tc.id, name = tc.name, input = deconst(tc.input)))
+                } elif (ev.content_block is _thinking) {
+                    let th & = unsafe(ev.content_block as _thinking)
+                    content_blocks[ev.index] = ContentBlock(_thinking = ThinkingBlock(thinking = th.thinking, signature = th.signature))
+                }
+            } elif (event is _content_block_delta) {
+                let ev & = unsafe(event as _content_block_delta)
+                if (ev.delta is _text_delta) {
+                    if (content_blocks[ev.index] is _text) {
+                        var existing & = unsafe(content_blocks[ev.index] as _text)
+                        existing.text = "{existing.text}{(ev.delta as _text_delta).text}"
+                    }
+                } elif (ev.delta is _input_json_delta) {
+                    let partial = (ev.delta as _input_json_delta).partial_json
+                    unsafe {
+                        tool_json_bufs[ev.index] = "{tool_json_bufs[ev.index]}{partial}"
+                    }
+                } elif (ev.delta is _thinking_delta) {
+                    if (content_blocks[ev.index] is _thinking) {
+                        var existing & = unsafe(content_blocks[ev.index] as _thinking)
+                        existing.thinking = "{existing.thinking}{(ev.delta as _thinking_delta).thinking}"
+                    }
+                }
+            } elif (event is _message_delta) {
+                let ev & = unsafe(event as _message_delta)
+                msg.stop_reason = ev.delta.stop_reason
+                msg.usage.output_tokens = ev.usage.output_tokens
+            }
+        }, error)
+        if (!empty(error)) {
+            break
+        }
+        // finalize tool_use blocks with parsed JSON input
+        for (idx, json_buf in keys(tool_json_bufs), values(tool_json_bufs)) {
+            if (content_blocks[idx] is _tool_use) {
+                var blk & = unsafe(content_blocks[idx] as _tool_use)
+                var parse_err = ""
+                blk.input = read_json(json_buf, parse_err)
+            }
+        }
+        msg.content <- content_blocks
+        if (!has_tool_use(msg)) {
+            break
+        }
+        // build assistant turn and tool results, same as run_tool_loop
+        var assistant_blocks : array<ContentBlockParam>
+        for (blk in msg.content) {
+            if (blk is _text) {
+                assistant_blocks |> emplace(text_param((blk as _text).text))
+            } elif (blk is _tool_use) {
+                let tc & = unsafe(blk as _tool_use)
+                var inp = deconst(tc.input)
+                assistant_blocks |> emplace(tool_use_param(tc.id, tc.name, inp))
+            }
+        }
+        params.messages |> emplace(assistant_message(assistant_blocks))
+        var result_blocks : array<ContentBlockParam>
+        for (blk in msg.content) {
+            if (blk is _tool_use) {
+                let tc & = unsafe(blk as _tool_use)
+                let result_text = invoke(handler, tc)
+                result_blocks |> emplace(tool_result_param(tc.id, result_text))
+            }
+        }
+        params.messages |> emplace(user_message(result_blocks))
+    }
+    return <- msg
+}
