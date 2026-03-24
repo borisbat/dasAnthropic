@@ -4,7 +4,7 @@ options no_unused_function_arguments = false
 options indenting = 4
 
 require anthropic/anthropic
-require fio
+require daslib/fio
 require strings
 
 // Interactive streaming chat with Claude.

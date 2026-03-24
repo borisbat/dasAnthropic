@@ -6,7 +6,7 @@ options indenting = 4
 require dastest/testing_boost public
 require daslib/json_boost
 require anthropic/anthropic
-require fio
+require daslib/fio
 
 // ============================================================================
 // Unit tests — SSE line parser

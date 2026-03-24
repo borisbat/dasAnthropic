@@ -13,7 +13,7 @@ module anthropic shared private
 //! convenience helpers for building requests and parsing responses.
 
 require strings
-require fio
+require daslib/fio
 require dashv/dashv_boost
 require daslib/json_boost
 
