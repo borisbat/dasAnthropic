@@ -860,9 +860,10 @@ def public parse_sse_lines(var buf : string&; callback : block<(event_type, data
         var event_type = ""
         var data = ""
         var pos = 0
-        while (pos < length(event_text)) {
+        let event_text_len = length(event_text)
+        while (pos < event_text_len) {
             let nl = find(event_text, "\n", pos)
-            let line_end = nl >= 0 ? nl : length(event_text)
+            let line_end = nl >= 0 ? nl : event_text_len
             let line = slice(event_text, pos, line_end)
             if (starts_with(line, "event: ")) {
                 event_type = slice(line, 7)

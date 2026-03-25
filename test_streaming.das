@@ -98,7 +98,7 @@ def test_ask_stream(t : T?) {
         // fragments should concatenate to the full text
         var accumulated = ""
         for (f in fragments) {
-            accumulated = "{accumulated}{f}"
+            accumulated = "{accumulated}{f}" // nolint:PERF004 test validation
         }
         t |> equal(accumulated, text)
     }
